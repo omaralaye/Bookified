@@ -1,314 +1,248 @@
-"use client"
+'use client';
 
-import React, { useState } from "react"
-import { useForm } from "react-hook-form"
-import { zodResolver } from "@hookform/resolvers/zod"
-import * as z from "zod"
-import { Upload, Image as ImageIcon, X } from "lucide-react"
-
-import {
-    Form,
-    FormControl,
-    FormField,
-    FormItem,
-    FormLabel,
-    FormMessage,
-} from "@/components/ui/form"
-import { Input } from "@/components/ui/input"
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
-import LoadingOverlay from "@/components/LoadingOverlay"
-import { cn } from "@/lib/utils"
-
-const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
-
-const formSchema = z.object({
-    pdfFile: z.instanceof(File, { message: "PDF file is required" }).refine((file) => file.size <= MAX_FILE_SIZE, "Max file size is 50MB"),
-    coverImage: z.instanceof(File).optional(),
-    title: z.string().min(1, "Title is required"),
-    author: z.string().min(1, "Author name is required"),
-    voice: z.string().min(1, "Please choose a voice"),
-})
-
-type FormValues = z.infer<typeof formSchema>
-
-const voices = {
-    male: [
-        { id: "dave", name: "Dave", desc: "Young male, British-Essex, casual & conversational" },
-        { id: "daniel", name: "Daniel", desc: "Middle-aged male, British, authoritative but warm" },
-        { id: "chris", name: "Chris", desc: "Male, casual & easy-going" },
-    ],
-    female: [
-        { id: "rachel", name: "Rachel", desc: "Young female, American, calm & clear" },
-        { id: "sarah", name: "Sarah", desc: "Young female, American, soft & approachable" },
-    ],
-}
+import React, { useState, useEffect } from 'react';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { Upload, ImageIcon } from 'lucide-react';
+import { UploadSchema } from '@/lib/zod';
+import { BookUploadFormValues } from '@/types';
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { ACCEPTED_PDF_TYPES, ACCEPTED_IMAGE_TYPES, DEFAULT_VOICE } from '@/lib/constants';
+import FileUploader from './FileUploader';
+import VoiceSelector from './VoiceSelector';
+import LoadingOverlay from './LoadingOverlay';
+import {useAuth, useUser} from "@clerk/nextjs";
+import { toast } from 'sonner';
+import {checkBookExists, createBook, saveBookSegments} from "@/lib/actions/book.actions";
+import {useRouter} from "next/navigation";
+import {parsePDFFile} from "@/lib/utils";
+import {upload} from "@vercel/blob/client";
 
 const UploadForm = () => {
-    const [isSynthesizing, setIsSynthesizing] = useState(false)
-    const [pdfName, setPdfName] = useState<string | null>(null)
-    const [coverName, setCoverName] = useState<string | null>(null)
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [isMounted, setIsMounted] = useState(false);
+    const { userId } = useAuth();
+    const router = useRouter()
 
-    const form = useForm<FormValues>({
-        resolver: zodResolver(formSchema),
+    useEffect(() => {
+        setIsMounted(true);
+    }, []);
+
+    const form = useForm<BookUploadFormValues>({
+        resolver: zodResolver(UploadSchema),
         defaultValues: {
-            title: "",
-            author: "",
-            voice: "rachel",
+            title: '',
+            author: '',
+            persona: '',
+            pdfFile: undefined,
+            c overImage: undefined,
         },
-    })
+    });
 
-    async function onSubmit(values: FormValues) {
-        setIsSynthesizing(true)
-        console.log("Submitting form:", values)
-        // Simulate API call
-        await new Promise((resolve) => setTimeout(resolve, 3000))
-        setIsSynthesizing(false)
-    }
-
-    const handlePdfChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0]
-        if (file) {
-            form.setValue("pdfFile", file)
-            setPdfName(file.name)
+    const onSubmit = async (data: BookUploadFormValues) => {
+        if(!userId) {
+           return toast.error("Please login to upload books");
         }
-    }
 
-    const handleCoverChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0]
-        if (file) {
-            form.setValue("coverImage", file)
-            setCoverName(file.name)
+        setIsSubmitting(true);
+
+        // PostHog -> Track Book Uploads...
+
+        try {
+            const existsCheck = await checkBookExists(data.title);
+
+            if(existsCheck.exists && existsCheck.book) {
+                toast.info("Book with same title already exists.");
+                form.reset()
+                router.push(`/books/${existsCheck.book.slug}`)
+                return;
+            }
+
+            const fileTitle = data.title.replace(/\s+/g, '-').toLowerCase();
+            const pdfFile = data.pdfFile;
+
+            const parsedPDF = await parsePDFFile(pdfFile);
+
+            if(parsedPDF.content.length === 0) {
+                toast.error("Failed to parse PDF. Please try again with a different file.");
+                return;
+            }
+
+            const uploadedPdfBlob = await upload(fileTitle, pdfFile, {
+                access: 'public',
+                handleUploadUrl: '/api/upload',
+                contentType: 'application/pdf'
+            });
+
+            let coverUrl: string;
+
+            if(data.coverImage) {
+                const coverFile = data.coverImage;
+                const uploadedCoverBlob = await upload(`${fileTitle}_cover.png`, coverFile, {
+                    access: 'public',
+                    handleUploadUrl: '/api/upload',
+                    contentType: coverFile.type
+                });
+                coverUrl = uploadedCoverBlob.url;
+            } else {
+                const response = await fetch(parsedPDF.cover)
+                const blob = await response.blob();
+
+                const uploadedCoverBlob = await upload(`${fileTitle}_cover.png`, blob, {
+                    access: 'public',
+                    handleUploadUrl: '/api/upload',
+                    contentType: 'image/png'
+                });
+                coverUrl = uploadedCoverBlob.url;
+            }
+
+            const book = await createBook({
+                clerkId: userId,
+                title: data.title,
+                author: data.author,
+                persona: data.persona,
+                fileURL: uploadedPdfBlob.url,
+                fileBlobKey: uploadedPdfBlob.pathname,
+                coverURL: coverUrl,
+                fileSize: pdfFile.size,
+            });
+
+            if(!book.success) {
+                toast.error(book.error as string || "Failed to create book");
+                if (book.isBillingError) {
+                    router.push("/subscriptions");
+                }
+                return;
+            }
+
+            if(book.alreadyExists) {
+                toast.info("Book with same title already exists.");
+                form.reset()
+                router.push(`/books/${book.data.slug}`)
+                return;
+            }
+
+            const segments = await saveBookSegments(book.data._id, userId, parsedPDF.content);
+
+            if(!segments.success) {
+                toast.error("Failed to save book segments");
+                throw new Error("Failed to save book segments");
+            }
+
+            form.reset();
+            router.push('/');
+        } catch (error) {
+            console.error(error);
+
+            toast.error("Failed to upload book. Please try again later.");
+        } finally {
+            setIsSubmitting(false);
         }
-    }
+    };
 
-    const removePdf = (e: React.MouseEvent) => {
-        e.stopPropagation()
-        form.resetField("pdfFile")
-        setPdfName(null)
-    }
-
-    const removeCover = (e: React.MouseEvent) => {
-        e.stopPropagation()
-        form.resetField("coverImage")
-        setCoverName(null)
-    }
+    if (!isMounted) return null;
 
     return (
-        <div className="new-book-wrapper">
-            {isSynthesizing && <LoadingOverlay />}
+        <>
+            {isSubmitting && <LoadingOverlay />}
 
-            <Form {...form}>
-                <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
-                    {/* PDF Upload */}
-                    <FormField
-                        control={form.control}
-                        name="pdfFile"
-                        render={() => (
-                            <FormItem>
-                                <FormLabel className="form-label">Book PDF File</FormLabel>
-                                <FormControl>
-                                    <div
-                                        className={cn(
-                                            "upload-dropzone file-upload-shadow border-2 border-dashed border-[#8B7355]/30",
-                                            pdfName && "upload-dropzone-uploaded"
-                                        )}
-                                        onClick={() => document.getElementById("pdf-upload")?.click()}
-                                    >
-                                        <input
-                                            id="pdf-upload"
-                                            type="file"
-                                            accept=".pdf"
-                                            className="hidden"
-                                            onChange={handlePdfChange}
+            <div className="new-book-wrapper">
+                <Form {...form}>
+                    <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+                        {/* 1. PDF File Upload */}
+                        <FileUploader
+                            control={form.control}
+                            name="pdfFile"
+                            label="Book PDF File"
+                            acceptTypes={ACCEPTED_PDF_TYPES}
+                            icon={Upload}
+                            placeholder="Click to upload PDF"
+                            hint="PDF file (max 50MB)"
+                            disabled={isSubmitting}
+                        />
+
+                        {/* 2. Cover Image Upload */}
+                        <FileUploader
+                            control={form.control}
+                            name="coverImage"
+                            label="Cover Image (Optional)"
+                            acceptTypes={ACCEPTED_IMAGE_TYPES}
+                            icon={ImageIcon}
+                            placeholder="Click to upload cover image"
+                            hint="Leave empty to auto-generate from PDF"
+                            disabled={isSubmitting}
+                        />
+
+                        {/* 3. Title Input */}
+                        <FormField
+                            control={form.control}
+                            name="title"
+                            render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel className="form-label">Title</FormLabel>
+                                    <FormControl>
+                                        <Input
+                                            className="form-input"
+                                            placeholder="ex: Rich Dad Poor Dad"
+                                            {...field}
+                                            disabled={isSubmitting}
                                         />
-                                        {pdfName ? (
-                                            <div className="flex items-center gap-3">
-                                                <span className="upload-dropzone-text truncate max-w-[200px]">{pdfName}</span>
-                                                <div onClick={removePdf} className="upload-dropzone-remove">
-                                                    <X size={20} />
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <>
-                                                <Upload className="upload-dropzone-icon" />
-                                                <span className="upload-dropzone-text">Click to upload PDF</span>
-                                                <span className="upload-dropzone-hint">PDF file (max 50MB)</span>
-                                            </>
-                                        )}
-                                    </div>
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
+                                    </FormControl>
+                                    <FormMessage />
+                                </FormItem>
+                            )}
+                        />
 
-                    {/* Cover Image Upload */}
-                    <FormField
-                        control={form.control}
-                        name="coverImage"
-                        render={() => (
-                            <FormItem>
-                                <FormLabel className="form-label">Cover Image (Optional)</FormLabel>
-                                <FormControl>
-                                    <div
-                                        className={cn(
-                                            "upload-dropzone file-upload-shadow border-2 border-dashed border-[#8B7355]/30",
-                                            coverName && "upload-dropzone-uploaded"
-                                        )}
-                                        onClick={() => document.getElementById("cover-upload")?.click()}
-                                    >
-                                        <input
-                                            id="cover-upload"
-                                            type="file"
-                                            accept="image/*"
-                                            className="hidden"
-                                            onChange={handleCoverChange}
+                        {/* 4. Author Input */}
+                        <FormField
+                            control={form.control}
+                            name="author"
+                            render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel className="form-label">Author Name</FormLabel>
+                                    <FormControl>
+                                        <Input
+                                            className="form-input"
+                                            placeholder="ex: Robert Kiyosaki"
+                                            {...field}
+                                            disabled={isSubmitting}
                                         />
-                                        {coverName ? (
-                                            <div className="flex items-center gap-3">
-                                                <span className="upload-dropzone-text truncate max-w-[200px]">{coverName}</span>
-                                                <div onClick={removeCover} className="upload-dropzone-remove">
-                                                    <X size={20} />
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <>
-                                                <ImageIcon className="upload-dropzone-icon" />
-                                                <span className="upload-dropzone-text">Click to upload cover image</span>
-                                                <span className="upload-dropzone-hint">Leave empty to auto-generate from PDF</span>
-                                            </>
-                                        )}
-                                    </div>
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
+                                    </FormControl>
+                                    <FormMessage />
+                                </FormItem>
+                            )}
+                        />
 
-                    {/* Title Input */}
-                    <FormField
-                        control={form.control}
-                        name="title"
-                        render={({ field }) => (
-                            <FormItem>
-                                <FormLabel className="form-label">Title</FormLabel>
-                                <FormControl>
-                                    <Input
-                                        placeholder="ex: Rich Dad Poor Dad"
-                                        className="form-input shadow-soft-sm border-[var(--border-subtle)]"
-                                        {...field}
-                                    />
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
+                        {/* 5. Voice Selector */}
+                        <FormField
+                            control={form.control}
+                            name="persona"
+                            render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel className="form-label">Choose Assistant Voice</FormLabel>
+                                    <FormControl>
+                                        <VoiceSelector
+                                            value={field.value}
+                                            onChange={field.onChange}
+                                            disabled={isSubmitting}
+                                        />
+                                    </FormControl>
+                                    <FormMessage />
+                                </FormItem>
+                            )}
+                        />
 
-                    {/* Author Input */}
-                    <FormField
-                        control={form.control}
-                        name="author"
-                        render={({ field }) => (
-                            <FormItem>
-                                <FormLabel className="form-label">Author Name</FormLabel>
-                                <FormControl>
-                                    <Input
-                                        placeholder="ex: Robert Kiyosaki"
-                                        className="form-input shadow-soft-sm border-[var(--border-subtle)]"
-                                        {...field}
-                                    />
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
+                        {/* 6. Submit Button */}
+                        <Button type="submit" className="form-btn" disabled={isSubmitting}>
+                            Begin Synthesis
+                        </Button>
+                    </form>
+                </Form>
+            </div>
+        </>
+    );
+};
 
-                    {/* Voice Selector */}
-                    <FormField
-                        control={form.control}
-                        name="voice"
-                        render={({ field }) => (
-                            <FormItem className="space-y-4">
-                                <FormLabel className="form-label">Choose Assistant Voice</FormLabel>
-                                <FormControl>
-                                    <RadioGroup
-                                        onValueChange={field.onChange}
-                                        defaultValue={field.value}
-                                        className="space-y-6"
-                                    >
-                                        <div>
-                                            <h4 className="text-sm font-medium text-[var(--text-secondary)] mb-3">Male Voices</h4>
-                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                                {voices.male.map((voice) => (
-                                                    <FormItem key={voice.id} className="space-y-0">
-                                                        <FormControl>
-                                                            <RadioGroupItem value={voice.id} className="sr-only" />
-                                                        </FormControl>
-                                                        <FormLabel
-                                                            className={cn(
-                                                                "voice-selector-option min-h-[100px] flex-col items-start justify-center p-4",
-                                                                field.value === voice.id ? "voice-selector-option-selected" : "voice-selector-option-default"
-                                                            )}
-                                                        >
-                                                            <div className="flex items-center gap-2 mb-1">
-                                                                <div className={cn(
-                                                                    "w-4 h-4 rounded-full border flex items-center justify-center",
-                                                                    field.value === voice.id ? "border-[#663820]" : "border-gray-300"
-                                                                )}>
-                                                                    {field.value === voice.id && <div className="w-2 h-2 rounded-full bg-[#663820]" />}
-                                                                </div>
-                                                                <span className="font-bold text-[#212a3b]">{voice.name}</span>
-                                                            </div>
-                                                            <span className="text-[10px] leading-tight text-[var(--text-secondary)]">{voice.desc}</span>
-                                                        </FormLabel>
-                                                    </FormItem>
-                                                ))}
-                                            </div>
-                                        </div>
-
-                                        <div>
-                                            <h4 className="text-sm font-medium text-[var(--text-secondary)] mb-3">Female Voices</h4>
-                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                {voices.female.map((voice) => (
-                                                    <FormItem key={voice.id} className="space-y-0">
-                                                        <FormControl>
-                                                            <RadioGroupItem value={voice.id} className="sr-only" />
-                                                        </FormControl>
-                                                        <FormLabel
-                                                            className={cn(
-                                                                "voice-selector-option min-h-[100px] flex-col items-start justify-center p-4",
-                                                                field.value === voice.id ? "voice-selector-option-selected" : "voice-selector-option-default"
-                                                            )}
-                                                        >
-                                                            <div className="flex items-center gap-2 mb-1">
-                                                                <div className={cn(
-                                                                    "w-4 h-4 rounded-full border flex items-center justify-center",
-                                                                    field.value === voice.id ? "border-[#663820]" : "border-gray-300"
-                                                                )}>
-                                                                    {field.value === voice.id && <div className="w-2 h-2 rounded-full bg-[#663820]" />}
-                                                                </div>
-                                                                <span className="font-bold text-[#212a3b]">{voice.name}</span>
-                                                            </div>
-                                                            <span className="text-[10px] leading-tight text-[var(--text-secondary)]">{voice.desc}</span>
-                                                        </FormLabel>
-                                                    </FormItem>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    </RadioGroup>
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
-
-                    <button type="submit" className="form-btn shadow-soft-md">
-                        Begin Synthesis
-                    </button>
-                </form>
-            </Form>
-        </div>
-    )
-}
-
-export default UploadForm
+export default UploadForm;
